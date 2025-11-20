@@ -1,0 +1,669 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { 
+  Wallet, 
+  LayoutGrid, 
+  Server, 
+  ArrowUpRight, 
+  CheckCircle2, 
+  AlertTriangle, 
+  Zap,
+  Cpu,
+  Activity,
+  Clock,
+  TrendingUp,
+  Plus,
+  Hexagon,
+  ShieldCheck,
+  BarChart3,
+  Timer,
+  Lock,
+  Loader2
+} from 'lucide-react';
+
+// --- FIREBASE İMPORTS ---
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, onSnapshot } from 'firebase/firestore';
+
+// --- SİSTEM AYARLARI ---
+const MINUTE_MS = 60000; // Gerçek 1 Dakika
+const LIFESPAN_DAYS = 30;
+const TOTAL_HARVESTS = LIFESPAN_DAYS * 24 * 60; // 43.200 Hasat
+
+// --- YATIRIM PAKETLERİ (NODE'LAR) ---
+const PACKAGES = [
+  { 
+    id: 'node_starter', 
+    name: 'Starter Node', 
+    cost: 100, 
+    incomePerMin: 1, 
+    color: 'text-cyan-400',
+    border: 'border-cyan-500/30',
+    glow: 'shadow-cyan-500/20',
+    gradient: 'from-cyan-900/40 to-slate-900',
+    icon: <Cpu size={20} />,
+    roi: 'ROI %120'
+  },
+  { 
+    id: 'node_growth', 
+    name: 'Growth Engine', 
+    cost: 500, 
+    incomePerMin: 6, 
+    color: 'text-emerald-400',
+    border: 'border-emerald-500/30',
+    glow: 'shadow-emerald-500/20',
+    gradient: 'from-emerald-900/40 to-slate-900',
+    icon: <Activity size={20} />,
+    roi: 'ROI %135'
+  },
+  { 
+    id: 'node_turbo', 
+    name: 'Turbo Reactor', 
+    cost: 2000, 
+    incomePerMin: 25, 
+    color: 'text-violet-400',
+    border: 'border-violet-500/30',
+    glow: 'shadow-violet-500/20',
+    gradient: 'from-violet-900/40 to-slate-900',
+    icon: <Zap size={20} />,
+    roi: 'ROI %150'
+  },
+  { 
+    id: 'node_quantum', 
+    name: 'Quantum Core', 
+    cost: 10000, 
+    incomePerMin: 130, 
+    color: 'text-amber-400',
+    border: 'border-amber-500/30',
+    glow: 'shadow-amber-500/20',
+    gradient: 'from-amber-900/40 to-slate-900',
+    icon: <Hexagon size={20} />,
+    roi: 'ROI %180'
+  }
+];
+
+const INITIAL_SLOTS = 6; 
+const DEFAULT_SLOTS = Array.from({ length: INITIAL_SLOTS }).map((_, i) => ({ 
+  id: i, 
+  packageId: null, 
+  activatedAt: null, 
+  lastClaimAt: null,
+  harvestsClaimed: 0
+}));
+const DEFAULTS = { 
+    balance: 1000, // Başlangıç bakiyesi
+    slots: DEFAULT_SLOTS,
+    withdrawals: [],
+};
+
+export default function App() {
+  const [activeTab, setActiveTab] = useState('dashboard');
+  const [balance, setBalance] = useState(DEFAULTS.balance); 
+  const [withdrawals, setWithdrawals] = useState(DEFAULTS.withdrawals);
+  const [slots, setSlots] = useState(DEFAULTS.slots);
+
+  // Hata Düzeltme: selectedPackage state'ini tanımladık
+  const [selectedPackage, setSelectedPackage] = useState(PACKAGES[0]);
+
+  const [notification, setNotification] = useState(null);
+  const [isLoading, setIsLoading] = useState(true);
+  
+  // --- FIREBASE STATE ---
+  const [db, setDb] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const dataRef = useRef({ balance: DEFAULTS.balance, slots: DEFAULTS.slots, withdrawals: DEFAULTS.withdrawals });
+
+  // Debounce/Throttle için zamanlayıcı referansı
+  const saveTimerRef = useRef(null);
+
+  // --- FIREBASE VE AUTH İLK BAŞLATMA ---
+  useEffect(() => {
+    try {
+      // Global değişkenleri kullan
+      const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+      const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+      
+      if (!firebaseConfig.apiKey) {
+        console.error("Firebase config is missing.");
+        setIsLoading(false);
+        return;
+      }
+
+      const app = initializeApp(firebaseConfig);
+      const firestore = getFirestore(app);
+      const auth = getAuth(app);
+      setDb(firestore);
+
+      // Auth durumunu dinle (Telegram ID'si alındığında çalışır)
+      const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
+        if (user) {
+          setUserId(user.uid);
+          setIsAuthReady(true);
+          console.log("Firebase Auth OK. User ID:", user.uid);
+        } else {
+          // Eğer token yoksa anonim giriş yap
+          try {
+            await signInAnonymously(auth);
+          } catch (error) {
+            console.error("Anonim giriş başarısız:", error);
+            setIsAuthReady(true);
+          }
+        }
+      });
+
+      // Custom Token ile giriş yapmayı dene
+      const signIn = async () => {
+        if (initialAuthToken) {
+          try {
+            await signInWithCustomToken(auth, initialAuthToken);
+          } catch (e) {
+            console.error("Custom Token ile giriş başarısız, anonim denenecek:", e);
+            await signInAnonymously(auth);
+          }
+        } else {
+          await signInAnonymously(auth);
+        }
+      };
+      
+      signIn();
+
+      return () => unsubscribeAuth();
+    } catch (e) {
+      console.error("Firebase başlatma hatası:", e);
+      setIsLoading(false);
+    }
+  }, []);
+
+  // --- VERİ SENKRONİZASYONU (Firestore onSnapshot) ---
+  useEffect(() => {
+    if (!isAuthReady || !db || !userId) return;
+
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+    // Veritabanı Yolu: /artifacts/{appId}/users/{userId}/minerData/profile
+    const userDocRef = doc(db, 'artifacts', appId, 'users', userId, 'minerData', 'profile');
+
+    const unsubscribeSnapshot = onSnapshot(userDocRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        setBalance(data.balance || DEFAULTS.balance);
+        setSlots(data.slots || DEFAULTS.slots);
+        setWithdrawals(data.withdrawals || DEFAULTS.withdrawals);
+        
+        // Veri referansını güncelle
+        dataRef.current = { balance: data.balance || DEFAULTS.balance, slots: data.slots || DEFAULTS.slots, withdrawals: data.withdrawals || DEFAULTS.withdrawals };
+        console.log("Firestore'dan veri yüklendi.");
+      } else {
+        // İlk kez kullanan kullanıcı, varsayılan verileri kaydet
+        saveDataToFirestore({ balance: DEFAULTS.balance, slots: DEFAULTS.slots, withdrawals: DEFAULTS.withdrawals });
+        console.log("Yeni kullanıcı, varsayılan veri kaydedildi.");
+      }
+      setIsLoading(false);
+    }, (error) => {
+      console.error("Firestore dinleme hatası:", error);
+      setIsLoading(false);
+    });
+
+    return () => unsubscribeSnapshot();
+  }, [db, userId, isAuthReady]);
+
+  // --- VERİ KAYDETME (Debounced) ---
+  const saveDataToFirestore = async (dataToSave) => {
+    if (!db || !userId) return;
+
+    if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current);
+    }
+
+    saveTimerRef.current = setTimeout(async () => {
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const userDocRef = doc(db, 'artifacts', appId, 'users', userId, 'minerData', 'profile');
+        try {
+            await setDoc(userDocRef, dataToSave, { merge: true });
+            dataRef.current = dataToSave; // Başarıyla kaydedildi
+            // console.log("Veri Firestore'a kaydedildi.");
+        } catch (e) {
+            console.error("Firestore'a kaydetme hatası:", e);
+        }
+    }, 1000); // 1 saniye debounce
+  };
+
+  // State değişimlerini dinle ve kaydet
+  useEffect(() => {
+    if (!isLoading && isAuthReady) {
+      const currentData = { balance, slots, withdrawals };
+      // Sadece gerçekten değiştiyse kaydet
+      if (JSON.stringify(currentData) !== JSON.stringify(dataRef.current)) {
+          saveDataToFirestore(currentData);
+      }
+    }
+  }, [balance, slots, withdrawals, isLoading, isAuthReady]);
+
+  // --- HESAPLAMALAR ---
+  const hourlyYield = slots.reduce((acc, slot) => {
+    if (!slot.packageId) return acc;
+    const pkg = PACKAGES.find(p => p.id === slot.packageId);
+    if (slot.harvestsClaimed >= TOTAL_HARVESTS) return acc;
+    return acc + (pkg.incomePerMin * 60);
+  }, 0);
+
+  const showNotification = (msg, type = 'info') => {
+    setNotification({ msg, type });
+    setTimeout(() => setNotification(null), 3000);
+  };
+
+  // Zamanlayıcı (UI Yenileme)
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(() => setTick(t => t + 1), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // --- EYLEMLER ---
+  const handleSlotClick = (slotId) => {
+    // selectedPackage artık App component'inin state'inden erişilebilir
+    const slot = slots.find(s => s.id === slotId);
+    const now = Date.now();
+
+    // 1. BOŞ SLOT -> PAKET SATIN AL
+    if (!slot.packageId) {
+      if (balance >= selectedPackage.cost) {
+        setBalance(prev => prev - selectedPackage.cost);
+        setSlots(prev => prev.map(s => s.id === slotId ? {
+          ...s,
+          packageId: selectedPackage.id,
+          activatedAt: now,
+          lastClaimAt: now,
+          harvestsClaimed: 0
+        } : s));
+        showNotification(`${selectedPackage.name} sisteme entegre edildi.`, 'success');
+      } else {
+        showNotification(`Yetersiz Bakiye: ${selectedPackage.cost} AZN gerekli`, 'error');
+      }
+      return;
+    }
+
+    // 2. DOLU SLOT -> HASAT (CLAIM)
+    if (slot.harvestsClaimed >= TOTAL_HARVESTS) {
+      showNotification('Bu paketin süresi doldu. Lütfen yenileyin.', 'error');
+      return; 
+    }
+
+    const pkg = PACKAGES.find(p => p.id === slot.packageId);
+    const timeDiff = now - slot.lastClaimAt;
+    const minutesPassed = Math.floor(timeDiff / MINUTE_MS);
+    
+    if (minutesPassed >= 1) {
+      const remainingLife = TOTAL_HARVESTS - slot.harvestsClaimed;
+      const claimableAmount = Math.min(minutesPassed, remainingLife);
+
+      if (claimableAmount > 0) {
+        const reward = claimableAmount * pkg.incomePerMin;
+        setBalance(prev => prev + reward);
+        
+        const remainder = timeDiff % MINUTE_MS; 
+        
+        setSlots(prev => prev.map(s => s.id === slotId ? {
+          ...s,
+          lastClaimAt: now - remainder,
+          harvestsClaimed: s.harvestsClaimed + claimableAmount
+        } : s));
+        
+        showNotification(`+${reward} AZN Transfer Edildi`, 'success');
+      }
+    } else {
+      const secondsLeft = 60 - Math.floor((timeDiff % MINUTE_MS) / 1000);
+      showNotification(`Döngü bekleniyor: ${secondsLeft}sn`, 'info');
+    }
+  };
+
+  const renderContent = () => {
+    if (isLoading) {
+        return (
+            <div className="flex-1 flex flex-col items-center justify-center bg-[#03060a]/90">
+                <Loader2 size={32} className="text-blue-500 animate-spin mb-4" />
+                <p className="text-sm text-slate-400">Veri Senkronizasyonu...</p>
+            </div>
+        );
+    }
+    
+    switch (activeTab) {
+      case 'dashboard': return <DashboardModule 
+        balance={balance} 
+        slots={slots} 
+        onSlotClick={handleSlotClick} 
+        selectedPackage={selectedPackage} 
+        setSelectedPackage={setSelectedPackage}
+        hourlyYield={hourlyYield}
+        userId={userId} 
+      />;
+      case 'wallet': return <WalletModule balance={balance} withdrawals={withdrawals} setBalance={setBalance} setWithdrawals={setWithdrawals} showNotification={showNotification} />;
+      default: return <DashboardModule />;
+    }
+  };
+
+  return (
+    <div className="flex items-center justify-center min-h-screen bg-[#03060a] font-sans select-none text-slate-200">
+      <div className="w-full max-w-md h-[100dvh] relative flex flex-col shadow-2xl border-x border-white/5 bg-[#03060a] overflow-hidden">
+        
+        {/* Profesyonel Arka Plan Izgarası */}
+        <div className="absolute inset-0 pointer-events-none z-0">
+          <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.03)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.03)_1px,transparent_1px)] bg-[size:40px_40px] [mask-image:radial-gradient(ellipse_80%_50%_at_50%_0%,#000_70%,transparent_110%)]"></div>
+          <div className="absolute top-[-10%] right-[-5%] w-[300px] h-[300px] bg-blue-600/20 rounded-full blur-[120px]"></div>
+          <div className="absolute bottom-[-10%] left-[-5%] w-[300px] h-[300px] bg-indigo-600/10 rounded-full blur-[120px]"></div>
+        </div>
+        
+        {/* Bildirim */}
+        {notification && (
+          <div className={`fixed top-10 left-1/2 transform -translate-x-1/2 z-[100] px-5 py-3 rounded-xl backdrop-blur-md border shadow-2xl text-xs font-bold flex items-center gap-3 animate-in fade-in slide-in-from-top-4 ${
+             notification.type === 'success' ? 'bg-emerald-950/80 border-emerald-500/50 text-emerald-400' : 
+             notification.type === 'error' ? 'bg-rose-950/80 border-rose-500/50 text-rose-400' : 'bg-blue-950/80 border-blue-500/50 text-blue-400'
+          }`}>
+            {notification.type === 'success' ? <CheckCircle2 size={16}/> : <AlertTriangle size={16}/>}
+            {notification.msg}
+          </div>
+        )}
+
+        <div className="flex-1 relative z-10 overflow-hidden h-full">
+          {renderContent()}
+        </div>
+
+        {/* Navigation Bar */}
+        <div className="h-[75px] bg-[#05080e]/90 backdrop-blur-xl border-t border-white/5 w-full z-40 px-8 absolute bottom-0 flex justify-between items-center pb-2">
+            <NavButton icon={<LayoutGrid size={20} />} label="Panel" active={activeTab === 'dashboard'} onClick={() => setActiveTab('dashboard')} />
+            <NavButton icon={<Server size={20} />} label="Nodes" active={activeTab === 'market'} onClick={() => showNotification('Hızlı erişim menüsünü kullanın.', 'info')} />
+            <NavButton icon={<Wallet size={20} />} label="Assets" active={activeTab === 'wallet'} onClick={() => setActiveTab('wallet')} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// --- DASHBOARD: DEFI CONTROL CENTER ---
+const DashboardModule = ({ balance, slots, onSlotClick, selectedPackage, setSelectedPackage, hourlyYield, userId }) => {
+  return (
+    <div className="flex flex-col h-full overflow-hidden pb-24">
+      
+      {/* Header Stats */}
+      <div className="pt-14 pb-6 px-6 relative z-10 border-b border-white/5 bg-gradient-to-b from-blue-950/20 to-transparent">
+        <div className="flex justify-between items-start mb-6">
+          <div>
+             <div className="flex items-center gap-2 text-blue-400 mb-1.5">
+               <ShieldCheck size={14} className="animate-pulse" />
+               <span className="text-[10px] font-bold tracking-[0.25em] uppercase opacity-90">Secure Connection</span>
+             </div>
+             <h1 className="text-4xl font-bold text-white tracking-tighter flex items-center gap-2 drop-shadow-xl">
+               {balance.toLocaleString()} <span className="text-lg font-medium text-slate-600">AZN</span>
+             </h1>
+          </div>
+          <div className="text-right">
+             <div className="text-[9px] text-slate-400 uppercase tracking-wider font-bold mb-1">Tahmini Getiri</div>
+             <div className="flex items-center justify-end gap-2">
+                <div className="px-2 py-1 rounded bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-mono font-bold">
+                   +{hourlyYield}/saat
+                </div>
+             </div>
+          </div>
+        </div>
+        
+        {/* Mini Metrics */}
+        <div className="grid grid-cols-3 gap-3">
+           <StatBadge label="Node Durumu" value={`${slots.filter(s=>s.packageId).length}/${slots.length} Aktif`} icon={<Activity size={12}/>} color="text-blue-400" />
+           <StatBadge label="Döngü Süresi" value="60.00 sn" icon={<Clock size={12}/>} color="text-amber-400" />
+           <StatBadge label="Ağ Gecikmesi" value="12 ms" icon={<Zap size={12}/>} color="text-purple-400" />
+        </div>
+        
+        {/* Kullanıcı ID'si (Zorunlu) */}
+        {userId && (
+            <div className="mt-4 text-center p-2 bg-white/5 border border-white/10 rounded-lg">
+                <span className="text-[8px] text-slate-500 uppercase font-bold block">KULLANICI ID (Firestore Anahtarı)</span>
+                <span className="text-[9px] text-blue-400 font-mono break-all">{userId}</span>
+            </div>
+        )}
+      </div>
+
+      {/* MAIN GRID: INVESTMENT NODES */}
+      <div className="flex-1 overflow-y-auto px-6 pt-4 pb-4 custom-scrollbar">
+         <div className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-4 flex items-center gap-2">
+           <Server size={12} />
+           Aktif Madencilik Birimleri
+         </div>
+         
+         <div className="grid grid-cols-2 gap-3">
+           {slots.map(slot => {
+             const pkg = slot.packageId ? PACKAGES.find(p => p.id === slot.packageId) : null;
+             const now = Date.now();
+             
+             let progress = 0;
+             let isReady = false;
+             let remainingHarvests = TOTAL_HARVESTS;
+
+             if (slot.packageId) {
+               remainingHarvests = Math.max(0, TOTAL_HARVESTS - slot.harvestsClaimed);
+               
+               // Eğer paket ömrünü tamamladıysa
+               if (remainingHarvests === 0) {
+                 progress = 0;
+               } else {
+                 const elapsedSinceClaim = now - slot.lastClaimAt;
+                 progress = Math.min(100, (elapsedSinceClaim / MINUTE_MS) * 100);
+                 if (elapsedSinceClaim >= MINUTE_MS) {
+                   isReady = true;
+                   progress = 100;
+                 }
+               }
+             }
+
+             return (
+               <button 
+                 key={slot.id}
+                 onClick={() => onSlotClick(slot.id)}
+                 className={`relative aspect-[1.4/1] rounded-xl border flex flex-col justify-between p-3 transition-all duration-300 active:scale-[0.98] overflow-hidden group ${
+                    !slot.packageId 
+                      ? 'bg-[#080b12] border-white/5 hover:border-white/10' 
+                      : `bg-gradient-to-br ${pkg.gradient} ${pkg.border} shadow-lg`
+                 }`}
+               >
+                 {!slot.packageId ? (
+                   // BOŞ SLOT
+                   <div className="w-full h-full flex flex-col items-center justify-center text-slate-700 gap-2">
+                      <Plus size={24} className="group-hover:text-slate-500 transition-colors" />
+                      <span className="text-[9px] font-bold uppercase tracking-widest">Slot {slot.id + 1}</span>
+                   </div>
+                 ) : (
+                   // DOLU SLOT
+                   <>
+                      <div className="flex justify-between items-start w-full relative z-10">
+                         <div className="flex items-center gap-2">
+                            <div className={`${pkg.color}`}>{pkg.icon}</div>
+                            <div>
+                               <div className="text-[11px] font-bold text-white leading-none">{pkg.name}</div>
+                               <div className="text-[8px] text-slate-400 font-mono mt-0.5">{pkg.incomePerMin} AZN/dk</div>
+                            </div>
+                         </div>
+                         {isReady && <div className="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_#10b981] animate-pulse"></div>}
+                      </div>
+                      
+                      <div className="relative z-10 mt-auto">
+                         <div className="flex justify-between items-end mb-1.5">
+                            <div className="flex flex-col">
+                               <span className="text-[8px] text-slate-500 uppercase font-bold">Kalan Hasat</span>
+                               <span className="text-[10px] text-slate-300 font-mono">{remainingHarvests.toLocaleString()}</span>
+                            </div>
+                            <div className="text-[9px] font-bold text-emerald-400">
+                               {isReady ? 'HAZIR' : `${Math.round(progress)}%`}
+                            </div>
+                         </div>
+                         
+                         {/* Progress Bar */}
+                         <div className="h-1 bg-black/40 rounded-full overflow-hidden w-full">
+                            <div 
+                              className={`h-full transition-all duration-1000 ease-linear ${isReady ? 'bg-emerald-500 shadow-[0_0_10px_#10b981]' : 'bg-blue-600'}`}
+                              style={{ width: `${progress}%` }}
+                            ></div>
+                         </div>
+                      </div>
+
+                      {/* Overlay for Expired */}
+                      {remainingHarvests === 0 && (
+                        <div className="absolute inset-0 bg-black/80 flex items-center justify-center z-20 backdrop-blur-sm">
+                           <div className="flex flex-col items-center text-rose-500">
+                              <Lock size={24} className="mb-1" />
+                              <span className="text-[9px] font-bold uppercase">Süre Doldu</span>
+                           </div>
+                        </div>
+                      )}
+                   </>
+                 )}
+               </button>
+             );
+           })}
+         </div>
+      </div>
+
+      {/* PACKAGE SELECTOR (BOTTOM SHEET) */}
+      <div className="px-6 pt-4 pb-2 bg-[#05080e] border-t border-white/5 relative z-20">
+         <div className="flex justify-between items-center mb-3">
+            <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Paket Seçimi</div>
+            <div className="text-[9px] text-blue-400 font-bold flex items-center gap-1 bg-blue-500/10 px-2 py-1 rounded border border-blue-500/20">
+               Bakiye: {balance.toLocaleString()}
+            </div>
+         </div>
+         
+         <div className="flex gap-3 overflow-x-auto pb-2 scrollbar-hide">
+            {PACKAGES.map(pkg => {
+               const isSelected = selectedPackage.id === pkg.id;
+               return (
+                 <button
+                   key={pkg.id}
+                   onClick={() => setSelectedPackage(pkg)}
+                   className={`flex-shrink-0 w-36 p-3 rounded-xl border transition-all text-left relative group overflow-hidden ${
+                     isSelected 
+                       ? `bg-[#0f111a] ${pkg.border} ring-1 ${pkg.color.replace('text', 'ring')}` 
+                       : 'bg-[#080b12] border-white/5 hover:border-white/10'
+                   }`}
+                 >
+                    <div className="flex justify-between items-start mb-2">
+                       <div className={`${pkg.color}`}>{pkg.icon}</div>
+                       <div className="text-[8px] font-bold bg-white/5 px-1.5 py-0.5 rounded text-slate-400 border border-white/5">{pkg.roi}</div>
+                    </div>
+                    <div className="text-[11px] font-bold text-white truncate">{pkg.name}</div>
+                    <div className="flex justify-between items-end mt-2 pt-2 border-t border-white/5">
+                       {/* HATA DÜZELTME: Buradaki fazlalık '}' kaldırıldı. */}
+                       <div className="text-[10px] font-bold text-slate-400">{pkg.cost} AZN</div>
+                       <div className="text-[9px] text-emerald-400 font-mono font-bold">+{pkg.incomePerMin}/dk</div>
+                    </div>
+                 </button>
+               );
+            })}
+         </div>
+      </div>
+    </div>
+  );
+};
+
+const StatBadge = ({ label, value, icon, color }) => (
+  <div className="bg-[#080b12] border border-white/5 rounded-lg px-3 py-2 flex items-center gap-2.5 min-w-[100px]">
+    <div className={`${color}`}>{icon}</div>
+    <div>
+      <div className="text-[11px] font-bold text-white font-mono leading-none tracking-tight">{value}</div>
+      <div className="text-[8px] text-slate-500 uppercase leading-none mt-1 font-semibold">{label}</div>
+    </div>
+  </div>
+);
+
+// setBalance prop'u eklendi ve kullanıldı
+const WalletModule = ({ balance, withdrawals, setBalance, setWithdrawals, showNotification }) => {
+  const [addr, setAddr] = useState('');
+  const [amnt, setAmnt] = useState('');
+
+  const handleWithdraw = () => {
+    const amountToWithdraw = parseInt(amnt);
+    if (!addr || amountToWithdraw <= 0 || amountToWithdraw > balance) {
+      showNotification('Geçersiz parametreler veya yetersiz bakiye.', 'error');
+      return;
+    }
+
+    const newTx = { id: Date.now(), address: addr, amount: amountToWithdraw, status: 'pending', date: new Date().toLocaleDateString() };
+    
+    // Mantık hatası düzeltildi: Bakiye çekim sırasında düşülüyor
+    setBalance(prev => prev - amountToWithdraw); 
+
+    // Çekim talebini kaydet
+    setWithdrawals(prev => [newTx, ...prev]);
+    setAddr(''); setAmnt('');
+    showNotification(`-${amountToWithdraw} AZN transfer için beklemeye alındı.`, 'success');
+  };
+
+  return (
+    <div className="p-6 h-full overflow-y-auto pt-12 bg-[#03060a]">
+      <h2 className="text-2xl font-bold text-white mb-1">Varlık Yönetimi</h2>
+      <p className="text-slate-500 text-xs mb-8 font-medium">AZN token transfer ve likidite.</p>
+
+      {/* Premium Card */}
+      <div className="bg-gradient-to-br from-[#0a0f1c] to-black border border-white/10 p-6 rounded-2xl mb-8 relative overflow-hidden group shadow-2xl">
+         <div className="absolute -right-12 -top-12 w-48 h-48 bg-blue-600/10 blur-[80px] rounded-full"></div>
+         <div className="relative z-10">
+           <div className="flex items-center gap-2 mb-3">
+             <div className="p-1.5 bg-white/5 rounded border border-white/5"><Wallet size={14} className="text-white" /></div>
+             <div className="text-[10px] font-mono text-slate-400 font-bold tracking-wider">TOTAL BALANCE</div>
+           </div>
+           <div className="text-4xl font-mono font-bold text-white tracking-tight flex items-baseline gap-2">
+             {balance.toLocaleString()} <span className="text-lg text-slate-600 font-normal">AZN</span>
+           </div>
+         </div>
+      </div>
+
+      {/* Form */}
+      <div className="space-y-4 mb-8">
+         <div className="bg-[#080b12] border border-white/10 rounded-xl px-4 py-3 hover:border-blue-500/30 transition-colors focus-within:border-blue-500/50">
+            <label className="text-[9px] font-bold text-slate-500 uppercase block mb-1">Alıcı (TON Adresi)</label>
+            <input value={addr} onChange={e => setAddr(e.target.value)} placeholder="UQ..." className="w-full bg-transparent text-white text-sm font-mono outline-none placeholder-slate-700" />
+         </div>
+         <div className="flex gap-3">
+            <div className="bg-[#080b12] border border-white/10 rounded-xl px-4 py-3 flex-1 hover:border-blue-500/30 transition-colors focus-within:border-blue-500/50">
+              <label className="text-[9px] font-bold text-slate-500 uppercase block mb-1">Miktar</label>
+              <input type="number" value={amnt} onChange={e => setAmnt(e.target.value)} placeholder="0.00" className="w-full bg-transparent text-white text-sm font-mono outline-none placeholder-slate-700" />
+            </div>
+            <button onClick={() => setAmnt(balance)} className="px-5 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 text-blue-400 text-[10px] font-bold transition-colors">MAX</button>
+         </div>
+         <button onClick={handleWithdraw} className="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-4 rounded-xl shadow-lg shadow-blue-900/20 transition-all active:scale-[0.99] text-xs mt-2 tracking-wide">
+           TRANSFERİ BAŞLAT
+         </button>
+      </div>
+
+      {/* History */}
+      <div>
+        <h3 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-4">İşlem Geçmişi</h3>
+        <div className="space-y-3">
+          {withdrawals.map(tx => (
+            <div key={tx.id} className="flex justify-between items-center p-3 rounded-xl border border-white/5 bg-[#080b12] hover:bg-[#0f121a] transition-colors">
+               <div className="flex items-center gap-3">
+                 <div className="w-8 h-8 rounded-full bg-blue-500/10 flex items-center justify-center text-blue-500 border border-blue-500/20">
+                   <ArrowUpRight size={14} />
+                 </div>
+                 <div>
+                   <div className="text-white font-mono text-[11px] font-bold">Withdraw</div>
+                   <div className="text-[9px] text-slate-500">{tx.date}</div>
+                 </div>
+               </div>
+               <div className="text-right">
+                 <div className="text-white font-mono text-sm font-bold">-{tx.amount}</div>
+                 <div className="text-[9px] text-yellow-500 flex items-center justify-end gap-1">
+                    <Clock size={8} /> Beklemede
+                 </div>
+               </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const NavButton = ({ icon, label, active, onClick }) => (
+  <button onClick={onClick} className={`flex flex-col items-center justify-center gap-1.5 transition-all duration-200 w-20 ${active ? 'text-blue-400' : 'text-slate-600 hover:text-slate-400'}`}>
+    <div className={`${active ? 'scale-110 drop-shadow-[0_0_8px_rgba(59,130,246,0.5)]' : ''} transition-transform`}>{icon}</div>
+    <span className="text-[9px] font-bold tracking-wide uppercase">{label}</span>
+  </button>
+);
